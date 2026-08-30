@@ -1,34 +1,89 @@
 import datetime
 import logging
+import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
 from pymongo import MongoClient, UpdateOne
+from pymongo.errors import ConnectionFailure, OperationFailure, ServerSelectionTimeoutError
 from app.config import Config
 
 LOG = logging.getLogger(__name__)
 
 class MongoJobStore:
-    def __init__(self, uri: str = None) -> None:
+    def __init__(self, uri: str = None, max_retries: int = 3, retry_delay: float = 2.0) -> None:
         self.uri = uri or Config.MONGO_URI
-        self.client = MongoClient(self.uri)
+        self.client = self._connect_with_retry(max_retries=max_retries, retry_delay=retry_delay)
+
         # Parse db name from URI or use default
         db_name = self.uri.split('/')[-1].split('?')[0]
         if not db_name:
             db_name = 'job_scraper'
+        # Explicitly access/create the database before creating indexes so
+        # that authentication/connection issues surface with a clear message.
         self.db = self.client[db_name]
+
+        try:
+            # Force a round trip so connection/authentication problems are
+            # caught here instead of surfacing later on arbitrary queries.
+            self.client.admin.command('ping')
+        except OperationFailure as exc:
+            LOG.error(
+                "MongoDB authentication failed for db '%s'. Check that MONGO_URI "
+                "includes the correct credentials and authSource. Error: %s",
+                db_name, exc
+            )
+            raise
+        except (ConnectionFailure, ServerSelectionTimeoutError) as exc:
+            LOG.error("Could not connect to MongoDB at the configured URI. Error: %s", exc)
+            raise
+
         self.jobs = self.db.jobs
         self.profiles = self.db.profiles
 
         # Ensure indexes
-        self.jobs.create_index("job_id", unique=True)
-        self.jobs.create_index("status")
-        self.jobs.create_index("score")
-        
+        try:
+            self.jobs.create_index("job_id", unique=True)
+            self.jobs.create_index("status")
+            self.jobs.create_index("score")
+        except OperationFailure as exc:
+            LOG.error(
+                "Failed to create indexes on 'jobs' collection, likely due to "
+                "insufficient permissions or authentication failure: %s", exc
+            )
+            raise
+
         # We only keep one profile document, identified by _id="default"
         self.profiles.update_one(
             {"_id": "default"},
             {"$setOnInsert": {"scalars": {}, "lists": {}}},
             upsert=True
         )
+
+    def _connect_with_retry(self, max_retries: int, retry_delay: float) -> MongoClient:
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                client = MongoClient(self.uri, serverSelectionTimeoutMS=5000)
+                # Trigger server selection to detect connection issues early.
+                client.admin.command('ping')
+                return client
+            except (ConnectionFailure, ServerSelectionTimeoutError) as exc:
+                last_error = exc
+                LOG.warning(
+                    "MongoDB connection attempt %d/%d failed: %s",
+                    attempt, max_retries, exc
+                )
+                if attempt < max_retries:
+                    time.sleep(retry_delay)
+            except OperationFailure as exc:
+                # Authentication failures won't be fixed by retrying.
+                LOG.error(
+                    "MongoDB authentication failed. Verify MONGO_URI credentials "
+                    "and authSource (Railway MongoDB typically requires "
+                    "authSource=admin). Error: %s", exc
+                )
+                raise
+        LOG.error("Could not connect to MongoDB after %d attempts: %s", max_retries, last_error)
+        raise last_error
 
     def known_ids(self) -> set:
         return {doc["job_id"] for doc in self.jobs.find({}, {"job_id": 1})}
