@@ -5,7 +5,8 @@ __pycache__/
 venv/
 ENV/
 env/
-.env
+.env.*
+.env.example
 *.db
 *.sqlite
 applicant.json
@@ -13,3 +14,7 @@ config.json
 output/
 .DS_Store
 .idea/
+node_module*
+.serena*
+.claude*
+*dist/

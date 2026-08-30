@@ -37,6 +37,7 @@ from werkzeug.exceptions import HTTPException
 
 import app.resume as resume_mod
 import app.sources as sources
+from app.config import Config
 from app.database import MongoJobStore
 from app.s3_service import s3_service
 from app.scraper import (
@@ -144,7 +145,7 @@ def do_run(profile_raw: Dict[str, Any], opts: Dict[str, Any]) -> None:
         profile.locations = []
         log("Remote-only: searching every board worldwide, ignoring locations")
 
-    store = MongoJobStore(cfg.database)
+    store = MongoJobStore()
     jobs: List[Any] = []
     per_source: Dict[str, int] = {}
 
@@ -363,7 +364,7 @@ def api_status():
 @app.get("/api/jobs")
 def api_jobs():
     cfg = load_config()
-    store = MongoJobStore(cfg.database)
+    store = MongoJobStore()
     try:
         def as_int(name):
             raw = request.args.get(name)
@@ -391,6 +392,8 @@ def api_jobs():
         out = []
         for row in rows:
             item = {k: row[k] for k in row.keys()}
+            # Mongo hands back an ObjectId that json cannot encode.
+            item.pop("_id", None)
             item["source"] = source_of(item["job_id"])
             item.pop("description", None)  # keep the payload small
             item.pop("score_breakdown", None)
@@ -405,7 +408,7 @@ def api_jobs():
 @app.get("/api/stats")
 def api_stats():
     cfg = load_config()
-    store = MongoJobStore(cfg.database)
+    store = MongoJobStore()
     try:
         data = store.stats()
         by_source: Dict[str, int] = {}
@@ -425,7 +428,7 @@ def api_stats():
 def api_export():
     body = request.get_json(silent=True) or {}
     cfg = load_config()
-    store = MongoJobStore(cfg.database)
+    store = MongoJobStore()
     try:
         rows = store.query(min_score=float(body.get("min_score") or 0),
                            limit=int(body["limit"]) if body.get("limit") else None)
@@ -448,7 +451,7 @@ def api_export():
 def api_prune():
     body = request.get_json(silent=True) or {}
     cfg = load_config()
-    store = MongoJobStore(cfg.database)
+    store = MongoJobStore()
     try:
         removed = store.prune(int(body.get("days") or 45))
         return jsonify(ok=True, removed=removed)
@@ -483,22 +486,22 @@ def apply(job_id: str):
     back to the posting page when there isn't one.
     """
     cfg = load_config()
-    store = MongoJobStore(cfg.database)
+    store = MongoJobStore()
     try:
-        row = store.conn.execute(
-            "SELECT title, company, apply_url, job_url, status FROM jobs "
-            "WHERE job_id = ?", (job_id,)).fetchone()
+        row = store.jobs.find_one(
+            {"job_id": job_id},
+            {"title": 1, "company": 1, "apply_url": 1, "job_url": 1, "status": 1})
 
         if row is None:
             return jsonify(error=f"Unknown job {job_id}."), 404
 
-        target = (row["apply_url"] or "").strip() or (row["job_url"] or "").strip()
+        target = (row.get("apply_url") or "").strip() or (row.get("job_url") or "").strip()
         # Only ever bounce to a real http(s) page — never a javascript:/data:
         # URL that happened to land in a scraped field.
         if not target or urlparse(target).scheme not in ("http", "https"):
             return jsonify(
-                error=f"No application link stored for “{row['title'] or job_id}”"
-                      f"{' at ' + row['company'] if row['company'] else ''}. "
+                error=f"No application link stored for “{row.get('title') or job_id}”"
+                      f"{' at ' + row['company'] if row.get('company') else ''}. "
                       "Re-run the scrape for this source to pick one up."), 404
 
         # Deliberately does not mark the job applied. Opening a posting is not
@@ -591,10 +594,16 @@ PROFILE_LISTS = {"education": EDUCATION_FIELDS,
 
 
 def _shape(saved: Dict[str, Any]) -> Dict[str, Any]:
-    """Coerce whatever was stored into the current field set."""
-    data: Dict[str, Any] = {k: str(saved.get(k) or "") for k in APPLICANT_FIELDS}
+    """Coerce whatever was stored into the current field set.
+
+    Accepts both shapes: the store's {"scalars": ..., "lists": ...} document
+    and a flat dict such as applicant.json.
+    """
+    scalars = saved.get("scalars") if isinstance(saved.get("scalars"), dict) else saved
+    lists = saved.get("lists") if isinstance(saved.get("lists"), dict) else saved
+    data: Dict[str, Any] = {k: str(scalars.get(k) or "") for k in APPLICANT_FIELDS}
     for name, fields in PROFILE_LISTS.items():
-        data[name] = _clean_entries(saved.get(name), fields)
+        data[name] = _clean_entries(lists.get(name), fields)
     return data
 
 
@@ -616,7 +625,7 @@ def load_applicant() -> Dict[str, Any]:
     backup — nothing deletes it.
     """
     cfg = load_config()
-    store = MongoJobStore(cfg.database)
+    store = MongoJobStore()
     try:
         if not store.has_profile():
             legacy = _read_json_file()
@@ -654,7 +663,7 @@ def api_applicant_save():
         data[name] = _clean_entries(body.get(name), fields)
 
     cfg = load_config()
-    store = MongoJobStore(cfg.database)
+    store = MongoJobStore()
     try:
         _write_profile(store, data)
     finally:
@@ -852,7 +861,7 @@ def api_set_status(job_id: str):
     """Change where a job stands — or clear it with an empty status."""
     body = request.get_json(silent=True) or {}
     cfg = load_config()
-    store = MongoJobStore(cfg.database)
+    store = MongoJobStore()
     try:
         try:
             ok = store.set_status(job_id, body.get("status", ""))
@@ -881,6 +890,27 @@ def api_registry():
                    workday=[t[0] for t in sources.WORKDAY_TENANTS])
 
 
+@app.get("/api/meta")
+def api_meta():
+    """Everything the React app would otherwise hardcode twice."""
+    return jsonify(max_upload_mb=MAX_UPLOAD_MB,
+                   screening=SCREENING_QUESTIONS,
+                   applicant_fields=APPLICANT_FIELDS,
+                   lists=PROFILE_LISTS,
+                   max_entries=MAX_ENTRIES)
+
+
+# The React build, when there is one. Without it the old inline pages still
+# serve, so the app runs straight from a clone with no npm step.
+DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    "frontend", "dist")
+
+
+@app.get("/assets/<path:name>")
+def spa_assets(name: str):
+    return send_from_directory(os.path.join(DIST, "assets"), name)
+
+
 def render(template: str) -> str:
     """Both pages share the stylesheet and the fetch helpers."""
     return (template
@@ -892,6 +922,8 @@ def render(template: str) -> str:
 
 @app.get("/")
 def index():
+    if os.path.exists(os.path.join(DIST, "index.html")):
+        return send_from_directory(DIST, "index.html")
     return render(PAGE)
 
 
@@ -902,6 +934,8 @@ def profile_page():
     They outgrew the sidebar — the form is taller than the results it sat
     next to — so the dashboard now links here instead.
     """
+    if os.path.exists(os.path.join(DIST, "index.html")):
+        return send_from_directory(DIST, "index.html")
     return render(PAGE_PROFILE)
 
 
@@ -910,203 +944,9 @@ def profile_page():
 # --------------------------------------------------------------------------
 
 # The two pages share one stylesheet and one set of fetch helpers.
-_CSS = r"""  :root{
-    --bg:#0e1116; --panel:#161b22; --panel2:#1c232c; --line:#2a323d;
-    --fg:#e6edf3; --dim:#8b97a6; --accent:#4c8dff; --ok:#3fb950; --warn:#d29922; --bad:#f85149;
-  }
-  *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--fg);
-       font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
-  header{padding:18px 24px;border-bottom:1px solid var(--line);display:flex;
-         align-items:baseline;gap:14px;flex-wrap:wrap}
-  h1{font-size:17px;margin:0;letter-spacing:.2px}
-  .sub{color:var(--dim);font-size:12.5px}
-  main{max-width:1280px;margin:0 auto;padding:22px 24px 60px}
-  .grid{display:grid;grid-template-columns:380px minmax(0,1fr);gap:20px;align-items:start}
-  /* Grid items default to min-width:auto, so the wide results table would stop
-     its column shrinking and push a horizontal scrollbar onto the whole page. */
-  .grid > *{min-width:0}
-  /* The results table needs ~640px to read well; below that the side-by-side
-     layout squeezes it into a horizontal scrollbar, so stack instead. */
-  @media(max-width:1080px){.grid{grid-template-columns:minmax(0,1fr)}}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
-        padding:16px 18px;margin-bottom:18px}
-  .card h2{font-size:13px;text-transform:uppercase;letter-spacing:.7px;
-           color:var(--dim);margin:0 0 14px}
-  label{display:block;font-size:12px;color:var(--dim);margin:12px 0 5px}
-  input[type=text],input[type=number],select,textarea{
-    width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--fg);
-    border-radius:7px;padding:8px 10px;font:inherit;font-size:13px}
-  textarea{min-height:90px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
-  input[type=file]{width:100%;font-size:12.5px;color:var(--dim)}
-  button{background:var(--accent);color:#fff;border:0;border-radius:7px;
-         padding:9px 15px;font:inherit;font-weight:600;font-size:13px;cursor:pointer}
-  button:hover:not(:disabled){filter:brightness(1.12)}
-  button:disabled{opacity:.45;cursor:not-allowed}
-  button.ghost{background:transparent;border:1px solid var(--line);color:var(--fg);font-weight:500}
-  .row{display:flex;gap:9px;flex-wrap:wrap;align-items:center}
-  .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:9px}
-  .chip{background:var(--panel2);border:1px solid var(--line);border-radius:20px;
-        padding:3px 10px;font-size:11.5px;color:var(--dim)}
-  .chip b{color:var(--fg);font-weight:600}
-  .chk{display:flex;align-items:center;gap:7px;color:var(--fg);font-size:13px;margin:7px 0}
-  .chk input{accent-color:var(--accent);width:15px;height:15px}
-  /* Shrinks on short screens so the results table keeps the room. */
-  pre#log{background:#0a0d12;border:1px solid var(--line);border-radius:7px;padding:11px;
-      height:clamp(96px, 17vh, 210px);
-      overflow:auto;font:11.5px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;
-      color:#a9b6c5;margin:0;white-space:pre-wrap;word-break:break-word}
-  /* Fluid columns: percentage widths let the table shrink to whatever space
-     is left instead of forcing a horizontal scrollbar. */
-  table{width:100%;border-collapse:collapse;font-size:13px;table-layout:fixed}
-  td, th{overflow-wrap:anywhere}
-  th{white-space:nowrap}
-  .c-score{width:9%}
-  .c-title{width:24%}
-  .c-company{width:15%}
-  .c-loc{width:14%}
-  .c-exp{width:8%}
-  .c-posted{width:9%}
-  .c-source{width:10%}
-  .c-link{width:11%;padding-left:4px;padding-right:4px}
-  /* Source tags are long words in a narrow column — shrink them to fit. */
-  .c-source .tag{font-size:9px;padding:2px 5px;letter-spacing:.3px}
-  /* Narrow: drop the columns you can live without rather than scroll sideways,
-     and re-share the freed width instead of leaving the rest to overflow. */
-  @media(max-width:760px){
-    td, th{padding:8px 5px}
-    .c-posted, .c-exp{display:none}
-    .tag .full{display:none}
-    .tag .abbr{display:inline}
-    .c-score{width:10%} .c-title{width:34%} .c-company{width:18%}
-    .c-loc{width:16%} .c-source{width:11%} .c-link{width:11%}
-  }
-  /* Phone width: rather than crush six columns, move company and location
-     under the title and abbreviate the source tag. */
-  .rowsub{display:none;font-size:11px;color:var(--dim);margin-top:2px}
-  .tag .abbr{display:none}
-  @media(max-width:560px){
-    .c-loc, .c-company{display:none}
-    .rowsub{display:block}
-    th{font-size:10px;letter-spacing:.3px}
-    .c-score{width:14%} .c-title{width:55%} .c-source{width:14%} .c-link{width:17%}
-  }
-  th{position:sticky;top:0;background:var(--panel);text-align:left;color:var(--dim);
-     font-size:11px;text-transform:uppercase;letter-spacing:.6px;padding:9px 8px;
-     border-bottom:1px solid var(--line);z-index:1}
-  td{padding:9px 8px;border-bottom:1px solid #202832;vertical-align:top}
-  tr:hover td{background:#141a22}
-  .score{font-weight:700;color:var(--ok);font-variant-numeric:tabular-nums}
-  a{color:var(--accent);text-decoration:none}
-  a:hover{text-decoration:underline}
-  .tag{display:inline-block;font-size:10px;text-transform:uppercase;letter-spacing:.5px;
-       padding:2px 7px;border-radius:4px;background:var(--panel2);color:var(--dim);
-       border:1px solid var(--line)}
-  .tag.linkedin{color:#4c8dff;border-color:#24405f}
-  .tag.greenhouse{color:#3fb950;border-color:#1f4429}
-  .tag.workday{color:#d29922;border-color:#4a3a12}
-  .tag.ashby{color:#bc8cff;border-color:#3c2a55}
-  .tag.lever{color:#ff7b72;border-color:#5c2b28}
-  .tag.workable{color:#39c5cf;border-color:#1b4448}
-  .tag.remoteok{color:#f778ba;border-color:#54243d}
-  .muted{color:var(--dim)}
-  /* Apply points at /apply/<id>, which 302s to the real page — the row never
-     carries the destination URL. */
-  a.apply{display:inline-block;background:var(--accent);color:#fff;font-weight:600;
-          font-size:11.5px;padding:5px 9px;border-radius:6px;text-decoration:none;
-          white-space:nowrap}
-  a.apply:hover{filter:brightness(1.15);text-decoration:none}
-  /* Status picker under the Apply button; a tracked row is dimmed so the
-     untouched ones stand out. */
-  .statussel{margin-top:5px;width:100%;font-size:10.5px;padding:3px 4px;
-             background:var(--panel2);border:1px solid var(--line);color:var(--dim);
-             border-radius:5px}
-  .statussel.set{color:var(--ok);border-color:#1f4429}
-  /* Once a job has a status, Apply is gone — there is nothing to apply to
-     twice — and the picker is folded behind the chip. Click it to change. */
-  .statuschip{display:inline-block;font-size:10px;text-transform:uppercase;
-              letter-spacing:.5px;padding:4px 8px;border-radius:5px;cursor:pointer;
-              border:1px solid #1f4429;color:var(--ok);background:#132018;
-              white-space:nowrap}
-  .statuschip:hover{filter:brightness(1.3)}
-  .c-link[data-status=""] .statuschip{display:none}
-  .c-link:not([data-status=""]) a.apply{display:none}
-  .c-link:not([data-status=""]) .statussel{display:none}
-  .c-link.editing .statussel{display:block}
-  .c-link.editing .statuschip{display:none}
-  .statuschip.rejected{color:var(--bad);border-color:#5c2b28;background:#21100f}
-  .statuschip.offer{color:var(--warn);border-color:#4a3a12;background:#201a08}
-  .statuschip.saved{color:var(--dim);border-color:var(--line);background:var(--panel2)}
-  .askbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:11px 0 4px;
-          padding:10px 12px;border:1px solid #3c4a2a;background:#1b2417;
-          border-radius:8px;font-size:13px}
-  .askbar button{padding:5px 11px;font-size:12px}
-  tr.done td{opacity:.55}
-  tr.done .score{color:var(--dim)}
-  .err{color:var(--bad);font-size:12.5px;margin-top:9px;white-space:pre-wrap}
-  .ok{color:var(--ok);font-size:12.5px;margin-top:9px}
-  .stat{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #202832;font-size:13px}
-  .stat b{font-variant-numeric:tabular-nums}
-  /* Grow with the window instead of a fixed 640px box that leaves dead space. */
-  .scroll{max-height:clamp(320px, calc(100vh - 260px), 900px);
-          overflow:auto;border:1px solid var(--line);border-radius:8px}
-
-  /* Side by side, the left column (Apply kit + Database) is far taller than
-     the right, which used to leave the results stranded at the top with a
-     wall of empty space beside it. Stick the results panel to the viewport
-     and let it fill the height instead. */
-  @media(min-width:1081px){
-    .col-right{position:sticky;top:18px;max-height:calc(100vh - 36px);
-               display:flex;flex-direction:column}
-    .col-right .progress-card{flex:0 0 auto}
-    .col-right .results-card{flex:1;min-height:0;display:flex;flex-direction:column}
-    .results-scroll{flex:1;min-height:140px;max-height:none}
-  }
-  /* Progress is only interesting during a run, so it folds away and gives the
-     results table the height back. */
-  details#progress summary{cursor:pointer;list-style:none;display:flex;
-                           align-items:baseline;gap:10px}
-  details#progress summary::-webkit-details-marker{display:none}
-  details#progress summary::before{content:"▸";color:var(--dim);font-size:11px}
-  details#progress[open] summary::before{content:"▾"}
-  details#progress[open] summary{margin-bottom:12px}
-  details#progress summary h2{font-size:13px;text-transform:uppercase;
-                              letter-spacing:.7px;color:var(--dim)}
-  .terms{font-size:11px;color:var(--dim);margin-top:3px;line-height:1.35}
-  .spin{display:inline-block;width:11px;height:11px;border:2px solid var(--line);
-        border-top-color:var(--accent);border-radius:50%;animation:s .7s linear infinite;
-        vertical-align:-1px;margin-right:6px}
-  @keyframes s{to{transform:rotate(360deg)}}
-  .hint{font-size:11.5px;color:var(--dim);margin-top:7px}
-  /* Link styled as a button, for navigating between the two pages. */
-  a.btnlink{display:inline-block;background:var(--accent);color:#fff;font-weight:600;
-            font-size:13px;padding:9px 15px;border-radius:7px;text-decoration:none}
-  a.btnlink:hover{filter:brightness(1.12);text-decoration:none}
-  a.ghostlink{background:transparent;border:1px solid var(--line);color:var(--fg);
-              font-weight:500}
-  /* The Apply-kit page: one readable column of fields, not a sidebar. */
-  .formgrid{max-width:760px;margin:0 auto}
-  .formgrid .card{padding:20px 22px}
-  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-  .entry{background:var(--panel2);border:1px solid var(--line);border-radius:8px;
-         padding:12px 13px 14px;margin-bottom:10px}
-  .entry label{margin-top:6px}
-  .qrow{display:grid;grid-template-columns:1fr 130px;gap:10px;align-items:center;
-        padding:7px 0;border-bottom:1px solid #202832}
-  .qrow label{margin:0;font-size:12.5px;color:var(--fg)}
-  .qrow select{margin:0}
-  .entry .span2{grid-column:1 / -1}
-  .entry textarea{min-height:52px}
-  .entry-head{display:flex;justify-content:space-between;align-items:center;
-              padding-bottom:8px;margin-bottom:4px;border-bottom:1px solid var(--line)}
-  .entry-head b{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--fg)}
-  .entry-head a{font-size:11px;color:var(--dim)}
-  .entry-head a:hover{color:var(--bad);text-decoration:none}
-  code{background:var(--panel2);padding:1px 5px;border-radius:4px;font-size:11px}
-  a.bm{display:inline-block;background:var(--ok);color:#04140a;font-weight:700;
-       font-size:12.5px;padding:8px 14px;border-radius:7px;text-decoration:none;cursor:grab}
-  a.bm:hover{filter:brightness(1.1);text-decoration:none}
-"""
+# Same stylesheet the React app imports, so both stay in step.
+_CSS = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "frontend", "src", "app.css"), encoding="utf-8").read()
 
 _COMMON_JS = r"""
 const MAX_UPLOAD_MB = __MAX_UPLOAD_MB__;
@@ -1441,6 +1281,9 @@ async function status() {
     // Only usable once a resume has been analysed — this runs on load too.
     $("run").disabled = !profile;
     loadJobs(); loadStats(); loadFiles();
+  } else if (d.found > 0) {
+    // Refresh job list periodically during the run so results appear live.
+    loadJobs();
   }
 }
 
@@ -1642,7 +1485,7 @@ async function loadFiles() {
   try { d = await api("/api/files"); }
   catch (e) { return; }
   $("files").innerHTML = d.files.length
-    ? `<div class="hint" style="margin-top:13px">Exports</div>` + d.files.slice(0, 8).map(f =>
+    ? `<div class="hint" style="margin-top:13px">Exports</div>` + d.files.slice(0, 20).map(f =>
         `<div class="stat"><a href="/download/${encodeURIComponent(f.name)}">${esc(f.name)}</a>
          <span class="muted">${(f.size/1024).toFixed(0)} KB</span></div>`).join("")
     : "";
@@ -2183,32 +2026,37 @@ def self_check() -> int:
     # A bookmarklet is one line, so a // comment would swallow the rest of it.
     assert "//" not in _AUTOFILL_JS, "line comment would break the bookmarklet"
 
-    # The saved profile round-trips through the field whitelist.
-    # The profile lives in SQLite; scalars and every list entry survive a
-    # round-trip, and a field removed from the schema is dropped on read.
-    import tempfile
-    probe = os.path.join(tempfile.mkdtemp(), "probe.db")
-    probe_store = MongoJobStore(probe)
+    # The saved profile round-trips through the store. It runs against a
+    # scratch database that is dropped afterwards, so the real one is never
+    # touched; skipped entirely when MongoDB is not reachable.
+    scratch = Config.MONGO_URI.rsplit("/", 1)[0] + "/job_scraper_selfcheck"
     try:
-        assert probe_store.get_profile() == {} and not probe_store.has_profile()
-        probe_store.set_profile(
-            {"first_name": "A", "email": "a@b.c", "gone_field": "x"},
-            {"experience": [{"company": "One"}, {"company": "Two"}],
-             "education": [], "websites": [{"url": "https://x"}]})
-        assert probe_store.has_profile()
-        raw = probe_store.get_profile()
-        assert [e["company"] for e in raw["experience"]] == ["One", "Two"], raw
-        assert raw["websites"] == [{"url": "https://x"}], raw
-        assert "education" not in raw          # an empty list stores no rows
-        shaped = _shape(raw)
-        assert shaped["first_name"] == "A" and shaped["education"] == []
-        assert "gone_field" not in shaped, "a removed field should not resurface"
-        # Saving again replaces what was there rather than merging into it.
-        probe_store.set_profile({"first_name": "B"},
-                                {"experience": [], "education": [], "websites": []})
-        assert probe_store.get_profile() == {"first_name": "B"}
-    finally:
-        probe_store.close()
+        probe_store = MongoJobStore(scratch)
+        probe_store.client.admin.command("ping")
+    except Exception as exc:
+        print(f"  (profile store check skipped — MongoDB unreachable: "
+              f"{exc.__class__.__name__})")
+    else:
+        try:
+            probe_store.db.profiles.delete_many({})
+            probe_store.set_profile(
+                {"first_name": "A", "email": "a@b.c"},
+                {"experience": [{"company": "One"}, {"company": "Two"}],
+                 "education": [], "websites": [{"url": "https://x"}]})
+            assert probe_store.has_profile()
+            raw = probe_store.get_profile()
+            assert [e["company"] for e in raw["lists"]["experience"]] == ["One", "Two"], raw
+            assert raw["lists"]["websites"] == [{"url": "https://x"}], raw
+            assert raw["scalars"]["first_name"] == "A"
+            # Saving again replaces what was there rather than merging into it.
+            probe_store.set_profile({"first_name": "B"},
+                                    {"experience": [], "education": [], "websites": []})
+            again = probe_store.get_profile()
+            assert again["scalars"] == {"first_name": "B"}, again
+            assert again["lists"]["experience"] == [], again
+        finally:
+            probe_store.client.drop_database(probe_store.db.name)
+            probe_store.close()
 
     applicant = load_applicant()
     assert set(applicant) == set(APPLICANT_FIELDS) | {"education", "experience",

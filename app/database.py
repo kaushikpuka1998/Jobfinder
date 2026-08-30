@@ -56,22 +56,94 @@ class MongoJobStore:
         return result.upserted_count, result.modified_count
 
     def _build_filter(self, filters: Dict[str, Any]) -> dict:
-        query = {}
+        and_clauses = []
+
+        # -- status
         status = filters.get("status")
         if status is not None:
             if status.lower() == "none":
-                query["$or"] = [{"status": None}, {"status": ""}]
+                and_clauses.append({"$or": [{"status": None}, {"status": ""}]})
             elif status.lower() == "any":
-                query["status"] = {"$nin": [None, ""]}
+                and_clauses.append({"status": {"$nin": [None, ""]}})
             else:
-                query["status"] = status
-                
-        if filters.get("min_score", 0.0) > 0:
-            query["score"] = {"$gte": float(filters["min_score"])}
-            
-        # Simplified profile/text matching, if needed
-        # In a real scenario we'd use full text search or regex
-        return query
+                and_clauses.append({"status": status})
+
+        # -- score
+        min_score = float(filters.get("min_score") or 0)
+        if min_score > 0:
+            and_clauses.append({"score": {"$gte": min_score}})
+
+        # -- source (derived from job_id prefix)
+        source = filters.get("source")
+        if source:
+            source_patterns = {
+                "linkedin":   {"$regex": "^(?!gh:|ab:|lv:|wk:|wd:|ro:)"},
+                "greenhouse": {"$regex": "^gh:"},
+                "ashby":      {"$regex": "^ab:"},
+                "lever":      {"$regex": "^lv:"},
+                "workable":   {"$regex": "^wk:"},
+                "workday":    {"$regex": "^wd:"},
+                "remoteok":   {"$regex": "^ro:"},
+            }
+            if source in source_patterns:
+                and_clauses.append({"job_id": source_patterns[source]})
+            else:
+                and_clauses.append({"job_id": {"$regex": f"^{source}"}})
+
+        # -- search text (title, company, location)
+        search = filters.get("search")
+        if search:
+            regex = {"$regex": search, "$options": "i"}
+            and_clauses.append({"$or": [
+                {"title": regex},
+                {"company": regex},
+                {"location": regex},
+            ]})
+
+        # -- remote only
+        if filters.get("remote_only"):
+            and_clauses.append({"is_remote": True})
+
+        # -- experience overlap filter
+        exp_min = filters.get("exp_min")
+        exp_max = filters.get("exp_max")
+        include_unknown_exp = filters.get("include_unknown_exp", True)
+        if exp_min is not None or exp_max is not None:
+            want_min = exp_min if exp_min is not None else 0
+            want_max = exp_max if exp_max is not None else 999
+            range_overlap = {"$or": [
+                {"$and": [
+                    {"$or": [{"exp_max": None}, {"exp_max": {"$exists": False}}, {"exp_max": {"$gte": want_min}}]},
+                    {"$or": [{"exp_min": None}, {"exp_min": {"$exists": False}}, {"exp_min": {"$lte": want_max}}]},
+                ]},
+            ]}
+            if include_unknown_exp:
+                and_clauses.append({"$or": [
+                    {"$and": [{"$or": [{"exp_min": None}, {"exp_min": {"$exists": False}}]},
+                              {"$or": [{"exp_max": None}, {"exp_max": {"$exists": False}}]}]},
+                    range_overlap,
+                ]})
+            else:
+                and_clauses.append(range_overlap)
+
+        # -- profile
+        profile = filters.get("profile")
+        if profile:
+            and_clauses.append({"profile": profile})
+
+        # -- include rejected
+        if not filters.get("include_rejected", False):
+            and_clauses.append({"$or": [
+                {"rejected_reason": None},
+                {"rejected_reason": {"$exists": False}},
+                {"rejected_reason": ""},
+            ]})
+
+        if not and_clauses:
+            return {}
+        if len(and_clauses) == 1:
+            return and_clauses[0]
+        return {"$and": and_clauses}
 
     def query(self, limit: Optional[int] = None, **filters: Any) -> List[dict]:
         query = self._build_filter(filters)
@@ -101,27 +173,50 @@ class MongoJobStore:
         doc = self.get_profile()
         return bool(doc.get("scalars")) or bool(doc.get("lists"))
 
+    # Where you are with each job. "" means untouched.
+    STATUSES = ("applied", "interview", "offer", "rejected", "saved")
+
     def set_status(self, job_id: str, status: str) -> bool:
-        now = datetime.datetime.utcnow().isoformat()
+        """Record where a job stands. An unknown status is refused rather than
+        written, so a typo cannot quietly create a new state."""
+        status = (status or "").strip().lower()
+        if status and status not in self.STATUSES:
+            raise ValueError(f"unknown status {status!r}; "
+                             f"expected one of {', '.join(self.STATUSES)} or empty")
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
         result = self.jobs.update_one(
             {"job_id": job_id},
-            {"$set": {"status": status, "status_at": now}}
+            {"$set": {"status": status, "status_at": now if status else ""}}
         )
-        return result.modified_count > 0
+        # matched, not modified: setting the same status again is a no-op, not
+        # a missing job.
+        return result.matched_count > 0
 
     def status_counts(self) -> Dict[str, int]:
         pipeline = [
             {"$group": {"_id": "$status", "count": {"$sum": 1}}}
         ]
-        counts = {}
+        counts: Dict[str, int] = {}
         for row in self.jobs.aggregate(pipeline):
             key = row["_id"] or ""
-            counts[key] = row["count"]
+            counts[key] = counts.get(key, 0) + row["count"]
         return counts
 
     def stats(self) -> Dict[str, Any]:
+        total = self.jobs.count_documents({})
+        rejected = self.jobs.count_documents({"rejected_reason": {"$gt": ""}})
+        pipeline = [
+            {"$match": {"score": {"$gt": 0}}},
+            {"$group": {"_id": None, "avg": {"$avg": "$score"}, "max": {"$max": "$score"}}}
+        ]
+        agg = list(self.jobs.aggregate(pipeline))
+        avg_score = agg[0]["avg"] if agg else None
+        max_score = agg[0]["max"] if agg else None
         return {
-            "total_jobs": self.jobs.count_documents({}),
+            "total": total,
+            "rejected": rejected,
+            "avg_score": avg_score,
+            "max_score": max_score,
             "statuses": self.status_counts()
         }
 

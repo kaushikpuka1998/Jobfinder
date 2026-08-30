@@ -23,7 +23,7 @@ import re
 import zipfile
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from linkedin_job_scraper import term_hits, term_pattern
+from app.scraper import term_hits, term_pattern
 
 # --------------------------------------------------------------------------
 # Skill vocabulary: term -> weight when it appears in a job posting.

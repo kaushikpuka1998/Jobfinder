@@ -1261,6 +1261,16 @@ COLUMNS = [
 ]
 
 
+# The columns the CSV export carries, in order. Lost when this module was
+# split out of linkedin_job_scraper.py, which broke every export path.
+EXPORT_FIELDS = [
+    "score", "score_raw", "title", "company", "location", "posted_date", "seniority",
+    "exp_min", "exp_max", "employment_type", "is_remote", "applicants",
+    "salary_min", "salary_max", "salary_currency", "profile", "matched_terms",
+    "status", "status_at", "job_url", "apply_url", "company_url", "job_id",
+]
+
+
 def export_csv(rows: Sequence[dict], path: str) -> None:
     with open(path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=EXPORT_FIELDS, extrasaction="ignore")
@@ -1274,6 +1284,8 @@ def export_json(rows: Sequence[dict], path: str) -> None:
     payload = []
     for row in rows:
         item = {k: row[k] for k in row.keys()}
+        # Mongo documents carry an ObjectId that json cannot encode.
+        item.pop("_id", None)
         try:
             item["score_breakdown"] = json.loads(item.get("score_breakdown") or "{}")
         except (json.JSONDecodeError, TypeError):
@@ -1593,7 +1605,7 @@ def cmd_scrape(args: argparse.Namespace) -> int:
         for p in profiles:
             p.fetch_details = False
 
-    store = MongoJobStore(cfg.database)
+    store = MongoJobStore()
     client = LinkedInClient(cfg.http)
     scraper = JobScraper(client, store)
 
@@ -1644,7 +1656,7 @@ def write_exports(rows: Sequence[dict], output_dir: str, fmt: str) -> None:
 
 def cmd_export(args: argparse.Namespace) -> int:
     cfg = AppConfig.load(args.config)
-    store = MongoJobStore(cfg.database)
+    store = MongoJobStore()
     rows = store.query(
         min_score=args.min_score,
         profile=args.profile,
@@ -1660,7 +1672,7 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 def cmd_stats(args: argparse.Namespace) -> int:
     cfg = AppConfig.load(args.config)
-    store = MongoJobStore(cfg.database)
+    store = MongoJobStore()
     data = store.stats()
     print(f"\nDatabase: {cfg.database}")
     print(f"  Total postings : {data.get('total') or 0}")
@@ -1682,7 +1694,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
 def cmd_prune(args: argparse.Namespace) -> int:
     cfg = AppConfig.load(args.config)
-    store = MongoJobStore(cfg.database)
+    store = MongoJobStore()
     removed = store.prune(args.days)
     LOG.info("Removed %d rows not seen in the last %d days", removed, args.days)
     store.close()

@@ -24,11 +24,11 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import requests
 
-from linkedin_job_scraper import (
+from app.scraper import (
     Job,
     clean_text,
     detect_remote,
