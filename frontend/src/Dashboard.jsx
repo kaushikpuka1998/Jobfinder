@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, debounce } from "./api.js";
+import { api, debounce, isAdmin } from "./api.js";
 
 const SOURCE_OPTS = [
   ["s_gh", "greenhouse", "Greenhouse", "(42 boards)"],
@@ -264,7 +264,7 @@ export default function Dashboard() {
     setDberr(""); setDbok("");
     try {
       const d = await api("/api/export", { method: "POST", headers: { "Content-Type": "application/json" },
-                                           body: JSON.stringify({ format: "all" }) });
+                                           body: JSON.stringify({ format: "csv" }) });
       setDbok(`Exported ${d.rows} rows.`); loadFiles();
     } catch (e) { setDberr(e.message); }
   }
@@ -414,12 +414,22 @@ export default function Dashboard() {
 
           <div className="col-right">
             <div className="card progress-card">
-              <details id="progress" open={progressOpen} onToggle={e => setProgressOpen(e.target.open)}>
-                <summary><h2 style={{ display: "inline", margin: 0 }}>Progress</h2>
-                  <span className="muted">{runStatusText}</span></summary>
-                <pre id="log">{run.log && run.log.length ? run.log.join("\n")
-                  : "Idle. Analyse a resume, pick your sources, then hit “Fetch jobs”."}</pre>
-              </details>
+              {isAdmin() ? (
+                <details id="progress" open={progressOpen} onToggle={e => setProgressOpen(e.target.open)}>
+                  <summary><h2 style={{ display: "inline", margin: 0 }}>Progress</h2>
+                    <span className="muted">{runStatusText}</span></summary>
+                  <pre id="log">{run.log && run.log.length ? run.log.join("\n")
+                    : "Idle. Analyse a resume, pick your sources, then hit “Fetch jobs”."}</pre>
+                </details>
+              ) : (
+                // Non-admin visitors get the summary only — no expand
+                // arrow, no scrape log. Add ?admin=<token> to the URL once
+                // to unlock the full log in this browser.
+                <div className="row" style={{ justifyContent: "space-between" }}>
+                  <h2 style={{ margin: 0 }}>Status</h2>
+                  <span className="muted">{runStatusText || "Idle"}</span>
+                </div>
+              )}
             </div>
 
             <div className="card results-card">

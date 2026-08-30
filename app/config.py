@@ -10,3 +10,8 @@ class Config:
     AWS_SECRET_ACCESS_KEY = os.environ.get('AWS_SECRET_ACCESS_KEY')
     AWS_BUCKET_NAME = os.environ.get('AWS_BUCKET_NAME')
     AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
+    # Unset by default: the log/progress panel stays hidden from every
+    # visitor until this is set and someone opens /?admin=<token> once.
+    ADMIN_TOKEN = os.environ.get('ADMIN_TOKEN', '')
+    # Cron interval for the unattended background scrape, in seconds.
+    AUTO_RUN_INTERVAL_SECONDS = int(os.environ.get('AUTO_RUN_INTERVAL_SECONDS', 3600))

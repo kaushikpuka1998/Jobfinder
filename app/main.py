@@ -160,6 +160,9 @@ def do_run(profile_raw: Dict[str, Any], opts: Dict[str, Any]) -> None:
         # to raise here, outside any handler, and leave the run stuck at
         # "running" forever with no error shown (the UI just froze at 0).
         store = MongoJobStore()
+        # Remembered so the cron thread can replay this exact search
+        # unattended — the only place a search profile is persisted.
+        store.save_search_profile(profile_raw, opts)
 
         # -- Board sources first: they are fast and unmetered, and usually
         # clear the target alone, so a slow LinkedIn pass is never the blocker.
@@ -284,7 +287,7 @@ def do_run(profile_raw: Dict[str, Any], opts: Dict[str, Any]) -> None:
                                exp_min=want_min, exp_max=want_max,
                                include_unknown_exp=include_unknown,
                                remote_only=remote_only)
-            write_exports(rows, cfg.output_dir, "all")
+            write_exports(rows, cfg.output_dir, "csv")
             log(f"Exported {len(rows)} rows to {cfg.output_dir}/")
 
     except Exception as exc:  # noqa: BLE001 - surface anything to the UI
@@ -299,6 +302,48 @@ def do_run(profile_raw: Dict[str, Any], opts: Dict[str, Any]) -> None:
             RUN["running"] = False
             RUN["finished"] = time.time()
         log("Run finished.")
+
+
+def _auto_run_loop() -> None:
+    """The cron: replays the last manually-run search on a fixed interval.
+
+    ponytail: one in-process thread with a plain sleep loop, matching the
+    "single run, in memory" model the rest of this file already uses — swap
+    for a real scheduler (APScheduler, system cron) only if this ever needs
+    to survive across multiple worker processes.
+    """
+    while True:
+        time.sleep(Config.AUTO_RUN_INTERVAL_SECONDS)
+        try:
+            with RUN_LOCK:
+                if RUN["running"]:
+                    continue
+            store = MongoJobStore()
+            try:
+                saved = store.get_search_profile()
+            finally:
+                store.close()
+            if not saved:
+                continue  # nothing analysed yet — nothing to replay
+            with RUN_LOCK:
+                if RUN["running"]:
+                    continue
+                RUN.update(running=True, log=[], started=time.time(), finished=None,
+                           found=0, kept=0, inserted=0, updated=0, error=None, per_source={})
+            log("Cron: starting scheduled run")
+            do_run(saved["profile"], saved["options"])
+        except Exception:  # noqa: BLE001 - one bad tick must not kill the loop
+            app.logger.exception("Auto-run tick failed")
+
+
+# Started once at import time; gunicorn's default single worker (see
+# railway.json) means one thread, matching the rest of this app's
+# single-user, in-memory design.
+threading.Thread(target=_auto_run_loop, daemon=True).start()
+
+
+def _is_admin(req) -> bool:
+    return bool(Config.ADMIN_TOKEN) and req.headers.get("X-Admin-Token") == Config.ADMIN_TOKEN
 
 
 # --------------------------------------------------------------------------
@@ -364,6 +409,12 @@ def api_status():
         state = dict(RUN)
     state["elapsed"] = round((state["finished"] or time.time()) - state["started"], 1) \
         if state["started"] else 0
+    if not _is_admin(request):
+        # Everyone gets the summary pill (found/kept/elapsed); only an admin
+        # sees the line-by-line scrape log and per-source error detail.
+        state["log"] = []
+        state["per_source"] = {}
+        state["error"] = None
     return jsonify(state)
 
 
@@ -441,7 +492,7 @@ def api_export():
         if not rows:
             return jsonify(error="Nothing to export."), 400
         before = set(os.listdir(cfg.output_dir)) if os.path.isdir(cfg.output_dir) else set()
-        write_exports(rows, cfg.output_dir, body.get("format") or "all")
+        write_exports(rows, cfg.output_dir, body.get("format") or "csv")
         new = sorted(set(os.listdir(cfg.output_dir)) - before)
         uploaded = []
         for file in new:

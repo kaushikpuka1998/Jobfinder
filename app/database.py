@@ -176,6 +176,22 @@ class MongoJobStore:
         doc = self.get_profile()
         return bool(doc.get("scalars")) or bool(doc.get("lists"))
 
+    # The search profile (resume-derived keywords/scoring) plus the source
+    # picks and filters from the last manual run — a distinct document from
+    # the applicant autofill profile above. The cron job replays this one.
+    def save_search_profile(self, profile: Dict[str, Any], options: Dict[str, Any]) -> None:
+        self.profiles.update_one(
+            {"_id": "search"},
+            {"$set": {"profile": profile, "options": options}},
+            upsert=True
+        )
+
+    def get_search_profile(self) -> Optional[Dict[str, Any]]:
+        doc = self.profiles.find_one({"_id": "search"})
+        if not doc or not doc.get("profile"):
+            return None
+        return {"profile": doc["profile"], "options": doc.get("options", {})}
+
     # Where you are with each job. "" means untouched.
     STATUSES = ("applied", "interview", "offer", "rejected", "saved")
 
