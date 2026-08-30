@@ -145,9 +145,9 @@ def do_run(profile_raw: Dict[str, Any], opts: Dict[str, Any]) -> None:
         profile.locations = []
         log("Remote-only: searching every board worldwide, ignoring locations")
 
-    store = MongoJobStore()
     jobs: List[Any] = []
     per_source: Dict[str, int] = {}
+    store = None
 
     def note(source: str, found: List[Any]) -> None:
         per_source[source] = len(found)
@@ -156,6 +156,11 @@ def do_run(profile_raw: Dict[str, Any], opts: Dict[str, Any]) -> None:
             RUN["found"] = sum(per_source.values())
 
     try:
+        # Connecting lives inside the try now — a bad/missing MONGO_URI used
+        # to raise here, outside any handler, and leave the run stuck at
+        # "running" forever with no error shown (the UI just froze at 0).
+        store = MongoJobStore()
+
         # -- Board sources first: they are fast and unmetered, and usually
         # clear the target alone, so a slow LinkedIn pass is never the blocker.
         for name, fetch in BOARD_SOURCES.items():
@@ -288,7 +293,8 @@ def do_run(profile_raw: Dict[str, Any], opts: Dict[str, Any]) -> None:
         log(f"ERROR: {exc}")
         log(traceback.format_exc(limit=3))
     finally:
-        store.close()
+        if store is not None:
+            store.close()
         with RUN_LOCK:
             RUN["running"] = False
             RUN["finished"] = time.time()

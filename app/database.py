@@ -1,6 +1,7 @@
 import datetime
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
+from urllib.parse import urlparse
 from pymongo import MongoClient, UpdateOne
 from app.config import Config
 
@@ -10,10 +11,12 @@ class MongoJobStore:
     def __init__(self, uri: str = None) -> None:
         self.uri = uri or Config.MONGO_URI
         self.client = MongoClient(self.uri)
-        # Parse db name from URI or use default
-        db_name = self.uri.split('/')[-1].split('?')[0]
-        if not db_name:
-            db_name = 'job_scraper'
+        # The path component is the db name, e.g. "/job_scraper" -> "job_scraper".
+        # A naive uri.split("/")[-1] grabbed the host instead whenever Atlas's
+        # default URI (no db in the path, just "/?retryWrites=...") was used,
+        # producing a dotted "db name" like "cluster.mongodb.net" that Mongo
+        # rejects outright.
+        db_name = urlparse(self.uri).path.lstrip('/') or 'job_scraper'
         self.db = self.client[db_name]
         self.jobs = self.db.jobs
         self.profiles = self.db.profiles
