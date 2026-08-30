@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+.env
+*.db
+*.sqlite
+applicant.json
+config.json
+output/
+.DS_Store
+.idea/
