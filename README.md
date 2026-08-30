@@ -395,3 +395,4 @@ with rate limits, bot challenges (HTTP 999) and IP blocks. These endpoints are
 unauthenticated and public, and nothing here touches a logged-in session — but
 the markup is unversioned and changes without notice, so expect to update the
 CSS selectors in `parse_search_page` and `fetch_detail` periodically.
+# Jobfinder
