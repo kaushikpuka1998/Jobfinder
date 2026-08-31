@@ -148,12 +148,30 @@ class MongoJobStore:
             return and_clauses[0]
         return {"$and": and_clauses}
 
-    def query(self, limit: Optional[int] = None, **filters: Any) -> List[dict]:
+    def query(self, limit: Optional[int] = None, sort: str = "score", **filters: Any) -> List[dict]:
         query = self._build_filter(filters)
-        cursor = self.jobs.find(query).sort([("score", -1), ("posted_raw", -1)])
+        if sort not in ("exp_asc", "exp_desc"):
+            cursor = self.jobs.find(query).sort([("score", -1), ("posted_raw", -1)])
+            if limit:
+                cursor = cursor.limit(limit)
+            return list(cursor)
+
+        # Plain .sort() treats a missing/null exp_min as the lowest value,
+        # which puts unstated-experience postings first on "asc" and last on
+        # "desc" — inconsistent, and the low-first case buries every stated
+        # year behind hundreds of unstated ones. Unstated postings always
+        # belong at the bottom regardless of direction, so a computed sort
+        # key substitutes an extreme sentinel for null before sorting.
+        direction = 1 if sort == "exp_asc" else -1
+        sentinel = 10 ** 6 if sort == "exp_asc" else -(10 ** 6)
+        pipeline = [
+            {"$match": query},
+            {"$addFields": {"_sort_exp": {"$ifNull": ["$exp_min", sentinel]}}},
+            {"$sort": {"_sort_exp": direction, "score": -1}},
+        ]
         if limit:
-            cursor = cursor.limit(limit)
-        return list(cursor)
+            pipeline.append({"$limit": limit})
+        return list(self.jobs.aggregate(pipeline))
 
     def count(self, **filters: Any) -> int:
         return self.jobs.count_documents(self._build_filter(filters))

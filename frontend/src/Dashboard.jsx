@@ -2,12 +2,12 @@ import { useEffect, useRef, useState } from "react";
 import { api, debounce, isAdmin } from "./api.js";
 
 const SOURCE_OPTS = [
-  ["s_gh", "greenhouse", "Greenhouse", "(42 boards)"],
-  ["s_ab", "ashby", "Ashby", "(42 boards)"],
+  ["s_gh", "greenhouse", "Greenhouse", "(69 boards)"],
+  ["s_ab", "ashby", "Ashby", "(63 boards)"],
   ["s_lv", "lever", "Lever", "(9 boards)"],
   ["s_wk", "workable", "Workable", "(20 accounts)"],
   ["s_ro", "remoteok", "Remote OK", ""],
-  ["s_wd", "workday", "Workday", "(9 employers)"],
+  ["s_wd", "workday", "Workday", "(12 employers)"],
   ["s_li", "linkedin", "LinkedIn", "(slow, rate limited)"],
 ];
 const DEFAULT_ON = new Set(["greenhouse", "ashby", "lever", "workable", "remoteok", "workday"]);
@@ -67,6 +67,7 @@ export default function Dashboard() {
   const [fremote, setFremote] = useState(false);
   const [fstatus, setFstatus] = useState("");
   const [flimit, setFlimit] = useState("300");
+  const [fsort, setFsort] = useState("score");
   const [jobs, setJobs] = useState([]);
   const [jobsMeta, setJobsMeta] = useState({ total: 0, count: 0 });
   const [jobsErr, setJobsErr] = useState("");
@@ -92,10 +93,10 @@ export default function Dashboard() {
     const t = debounce(loadJobs, 300);
     t();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [q, fsource, fmin, fexpMin, fexpMax, fexpUnknown, fremote, fstatus, flimit]);
+  }, [q, fsource, fmin, fexpMin, fexpMax, fexpUnknown, fremote, fstatus, flimit, fsort]);
 
   async function loadJobs() {
-    const p = new URLSearchParams({ limit: flimit });
+    const p = new URLSearchParams({ limit: flimit, sort: fsort });
     if (q.trim()) p.set("q", q.trim());
     if (fsource) p.set("source", fsource);
     if (fmin) p.set("min_score", fmin);
@@ -109,6 +110,14 @@ export default function Dashboard() {
       setJobs(d.jobs); setJobsMeta({ total: d.total, count: d.count }); setJobsErr("");
     } catch (e) { setJobsErr(e.message); }
   }
+
+  // status() lives inside a setInterval started once and never recreated
+  // (see pollStatus below), so it keeps whatever loadJobs closure existed
+  // when the interval was created — meaning stale filters/sort forever,
+  // silently reapplied every time a run finishes. Routing through a ref
+  // that's reassigned on every render makes it always call the current one.
+  const loadJobsRef = useRef(loadJobs);
+  loadJobsRef.current = loadJobs;
 
   async function loadStats() {
     try { setStats(await api("/api/stats")); setStatsErr(""); }
@@ -149,9 +158,9 @@ export default function Dashboard() {
     setRun({ ...d, elapsed: Math.round(elapsed * 10) / 10 });
     if (!d.running) {
       if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
-      loadJobs(); loadStats(); loadFiles();
+      loadJobsRef.current(); loadStats(); loadFiles();
     } else if (d.found > 0) {
-      loadJobs();
+      loadJobsRef.current();
     }
   }
 
@@ -480,6 +489,11 @@ export default function Dashboard() {
                   <option value="1000">show 1000</option>
                   <option value="5000">show all</option>
                 </select>
+                <select value={fsort} onChange={e => setFsort(e.target.value)} style={{ width: "auto" }}>
+                  <option value="score">sort: best match</option>
+                  <option value="exp_asc">sort: experience, low first</option>
+                  <option value="exp_desc">sort: experience, high first</option>
+                </select>
                 <button className="ghost" onClick={loadJobs}>Refresh</button>
               </div>
               {job0 && (
@@ -517,7 +531,7 @@ export default function Dashboard() {
                           <div className="terms">{shortTerms(j.matched_terms)}</div>
                         </td>
                         <td className="c-company">{j.company}</td>
-                        <td className="c-loc muted">{j.location}{j.is_remote && <span className="tag"> remote</span>}</td>
+                        <td className="c-loc muted">{j.location}{!!j.is_remote && <span className="tag"> remote</span>}</td>
                         <td className="c-exp muted">{expLabel(j)}</td>
                         <td className="c-posted muted">{j.posted_date || "—"}</td>
                         <td className="c-source">
@@ -527,15 +541,25 @@ export default function Dashboard() {
                           </span>
                         </td>
                         <td className="c-link" data-status={j.status || ""}>
-                          <a className="apply" href={`/apply/${encodeURIComponent(j.job_id)}`}
-                             target="_blank" rel="noopener noreferrer"
-                             onClick={() => queueApply({ id: j.job_id, title: j.title, company: j.company })}>Apply</a>
-                          <select className={`statussel${j.status ? " set" : ""}`} value={j.status || ""}
-                                  onChange={e => setJobStatus(j.job_id, e.target.value, j.status || "")}>
-                            {["", "applied", "interview", "offer", "rejected", "saved"].map(v => (
-                              <option value={v} key={v}>{v || "not applied"}</option>
-                            ))}
-                          </select>
+                          <div className="link-row">
+                            {j.status ? (
+                              <button type="button" className="apply applied" disabled>{j.status}</button>
+                            ) : (
+                              <a className="apply" href={`/apply/${encodeURIComponent(j.job_id)}`}
+                                 target="_blank" rel="noopener noreferrer"
+                                 onClick={() => queueApply({ id: j.job_id, title: j.title, company: j.company })}>Apply</a>
+                            )}
+                            <select className={`statussel${j.status ? " set" : ""}`} value={j.status || ""}
+                                    onChange={e => setJobStatus(j.job_id, e.target.value, j.status || "")}>
+                              {/* Once a status is set, "not applied" drops out — picking a
+                                  real status again is how you change it, not blank it out. */}
+                              {["", "applied", "interview", "offer", "rejected", "saved"]
+                                .filter(v => v !== "" || !j.status)
+                                .map(v => (
+                                  <option value={v} key={v}>{v || "not applied"}</option>
+                                ))}
+                            </select>
+                          </div>
                         </td>
                       </tr>
                     )) : (

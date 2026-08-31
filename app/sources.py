@@ -50,6 +50,12 @@ GREENHOUSE_BOARDS = [
     "mixpanel", "gusto", "duolingo", "monzo", "postman", "faire", "chime",
     "n26", "getyourguide", "launchdarkly", "discord", "dropbox", "amplitude",
     "betterment", "wise", "airtable", "circleci",
+    # Added — probed live, all returning postings at add time.
+    "algolia", "calendly", "carta", "checkr", "cockroachlabs", "coursera",
+    "druva", "honor", "imc", "khanacademy", "lattice", "lyft", "masterclass",
+    "netlify", "newrelic", "nextdoor", "okta", "pinterest", "splice",
+    "squarespace", "tanium", "toast", "twitch", "udemy", "upstart",
+    "webflow", "zocdoc",
 ]
 
 # (tenant, workday cluster, career-site name)
@@ -63,6 +69,12 @@ WORKDAY_TENANTS = [
     ("adobe", "wd5", "external_experienced"),
     ("workday", "wd5", "Workday"),
     ("blackrock", "wd1", "BlackRock_Professional"),
+    # Added — probed live. Workday has no guessable slug pattern (tenant,
+    # cluster, and site name are independent per company), so unlike the
+    # boards above, growing this list means probing each company by hand.
+    ("pfizer", "wd1", "PfizerCareers"),
+    ("intel", "wd1", "External"),
+    ("target", "wd5", "targetcareers"),
 ]
 
 # Ashby boards — slug from jobs.ashbyhq.com/<slug>
@@ -74,6 +86,11 @@ ASHBY_BOARDS = [
     "omni", "dust", "column", "tennr", "posthog", "resend", "pylon",
     "browserbase", "railway", "openevidence", "neon", "paradigm", "stytch",
     "unit", "knock",
+    # Added — probed live, all returning postings at add time.
+    "airbyte", "anyscale", "baseten", "clickhouse", "cohere", "eightsleep",
+    "elevenlabs", "fireworks", "lambda", "langchain", "mercor", "meter",
+    "montecarlodata", "pinecone", "replit", "runway", "suno", "synthesia",
+    "temporal", "weaviate", "writer",
 ]
 
 # Lever boards — slug from jobs.lever.co/<slug>

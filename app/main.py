@@ -443,8 +443,9 @@ def api_jobs():
             status=request.args.get("status") or None,
         )
         limit = as_int("limit")
+        sort = request.args.get("sort") or "score"
         total = store.count(**filters)
-        rows = store.query(limit=limit, **filters)
+        rows = store.query(limit=limit, sort=sort, **filters)
 
         out = []
         for row in rows:

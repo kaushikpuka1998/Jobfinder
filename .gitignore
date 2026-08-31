@@ -17,4 +17,10 @@ output/
 node_module*
 .serena*
 .claude*
+# frontend/dist is committed on purpose — Railway's build (see railway.json)
+# is Python-only and never runs `npm run build`, so the checked-in build
+# output is what actually ships. Run `npm run build` in frontend/ and
+# commit the result whenever frontend/src changes.
 *dist/
+!frontend/dist/
+!frontend/dist/**
