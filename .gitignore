@@ -5,8 +5,9 @@ __pycache__/
 venv/
 ENV/
 env/
-.env.*
-.env.example
+.env
+.env.local
+.env.*.local
 *.db
 *.sqlite
 applicant.json

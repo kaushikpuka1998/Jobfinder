@@ -76,6 +76,12 @@ class MongoJobStore:
         if min_score > 0:
             and_clauses.append({"score": {"$gte": min_score}})
 
+        # -- ATS (Claude) score — only set on the top-N jobs from a run, so
+        # this implicitly excludes everything Claude never looked at.
+        min_ats_score = filters.get("min_ats_score")
+        if min_ats_score is not None:
+            and_clauses.append({"ats_score": {"$gte": float(min_ats_score)}})
+
         # -- source (derived from job_id prefix)
         source = filters.get("source")
         if source:
@@ -150,6 +156,29 @@ class MongoJobStore:
 
     def query(self, limit: Optional[int] = None, sort: str = "score", **filters: Any) -> List[dict]:
         query = self._build_filter(filters)
+        if sort == "recent":
+            # Mongo's ObjectId encodes its creation time and — because
+            # upsert_many always upserts by job_id rather than re-inserting
+            # — never changes on a later update, so sorting by _id is
+            # exactly "when this job was first added", with no extra field
+            # or migration needed. (first_seen/last_seen on Job are never
+            # actually populated — a separate, pre-existing gap.)
+            cursor = self.jobs.find(query).sort([("_id", -1)])
+            if limit:
+                cursor = cursor.limit(limit)
+            return list(cursor)
+        if sort == "ats":
+            # Highest ATS score first; jobs Claude never scored (most of
+            # them — only the top-N per run get sent) sort to the bottom
+            # rather than mixing in ahead of real scores.
+            pipeline = [
+                {"$match": query},
+                {"$addFields": {"_sort_ats": {"$ifNull": ["$ats_score", -1]}}},
+                {"$sort": {"_sort_ats": -1, "score": -1}},
+            ]
+            if limit:
+                pipeline.append({"$limit": limit})
+            return list(self.jobs.aggregate(pipeline))
         if sort not in ("exp_asc", "exp_desc"):
             cursor = self.jobs.find(query).sort([("score", -1), ("posted_raw", -1)])
             if limit:
@@ -209,6 +238,23 @@ class MongoJobStore:
         if not doc or not doc.get("profile"):
             return None
         return {"profile": doc["profile"], "options": doc.get("options", {})}
+
+    # The one static resume file this deployment runs on — its S3 location,
+    # not the derived profile above. Single fixed key: uploading a new
+    # resume replaces this one, matching "one user, one static resume".
+    def save_resume_file(self, s3_key: str, filename: str, content_type: str) -> None:
+        self.profiles.update_one(
+            {"_id": "resume_file"},
+            {"$set": {"s3_key": s3_key, "filename": filename, "content_type": content_type,
+                     "uploaded_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}},
+            upsert=True
+        )
+
+    def get_resume_file(self) -> Optional[Dict[str, Any]]:
+        doc = self.profiles.find_one({"_id": "resume_file"})
+        if not doc:
+            return None
+        return {k: doc.get(k) for k in ("s3_key", "filename", "content_type", "uploaded_at")}
 
     # Where you are with each job. "" means untouched.
     STATUSES = ("applied", "interview", "offer", "rejected", "saved")

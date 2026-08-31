@@ -166,7 +166,11 @@ LEGACY_REFERENCE = 170.0
 # job_id prefix -> source name. LinkedIn ids are bare numbers, so it is the
 # fallback rather than an entry here.
 SOURCE_PREFIXES = {"greenhouse": "gh:", "ashby": "ab:", "lever": "lv:",
-                   "workable": "wk:", "workday": "wd:", "remoteok": "ro:"}
+                   "workable": "wk:", "workday": "wd:", "remoteok": "ro:",
+                   # Apify-sourced LinkedIn postings — namespaced so they
+                   # never collide with the direct scraper's bare numeric
+                   # ids, but still labelled "linkedin" in the UI.
+                   "linkedin": "apli:"}
 
 
 def source_of(job_id: str) -> str:
@@ -789,10 +793,14 @@ class Job:
     profile: str = ""
     search_keyword: str = ""
     search_location: str = ""
-    score: float = 0.0          # 0-100
+    score: float = 0.0          # 0-100, free keyword scorer
     score_raw: float = 0.0      # unnormalised keyword points
     score_breakdown: str = ""
     matched_terms: str = ""
+    # Second, deeper pass from Claude — set only for the top-scoring jobs
+    # from a run (see Config.ATS_TOP_N), null for the rest.
+    ats_score: Optional[int] = None
+    ats_reason: str = ""
     rejected_reason: str = ""
     status: str = ""          # "", applied, interview, offer, rejected
     status_at: str = ""

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, debounce, isAdmin } from "./api.js";
+import { api, debounce, getSession, login, logout } from "./api.js";
 
 const SOURCE_OPTS = [
   ["s_gh", "greenhouse", "Greenhouse", "(69 boards)"],
@@ -9,10 +9,11 @@ const SOURCE_OPTS = [
   ["s_ro", "remoteok", "Remote OK", ""],
   ["s_wd", "workday", "Workday", "(12 employers)"],
   ["s_li", "linkedin", "LinkedIn", "(slow, rate limited)"],
+  ["s_ap", "apify", "Apify LinkedIn (24h)", "(exclusive — turns off every other source)"],
 ];
 const DEFAULT_ON = new Set(["greenhouse", "ashby", "lever", "workable", "remoteok", "workday"]);
 const SOURCE_ABBR = { greenhouse: "GH", ashby: "AB", lever: "LV", workable: "WK",
-                      workday: "WD", linkedin: "LI", remoteok: "ROK" };
+                      workday: "WD", linkedin: "LI", remoteok: "ROK", apify: "AP" };
 const PENDING_KEY = "applyPending";
 
 const loadPending = () => { try { return JSON.parse(localStorage.getItem(PENDING_KEY) || "[]"); }
@@ -36,6 +37,38 @@ function expLabel(j) {
 
 export default function Dashboard() {
   const [maxUploadMb, setMaxUploadMb] = useState(25);
+  const [meta, setMeta] = useState({ apify_configured: false, apify_interval_hours: 8 });
+  const [admin, setAdmin] = useState(false);
+  const [loginEmail, setLoginEmail] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginErr, setLoginErr] = useState("");
+  const [loginOpen, setLoginOpen] = useState(false);
+  const [sessionEmail, setSessionEmail] = useState("");
+
+  async function refreshSession() {
+    try {
+      const d = await getSession();
+      setAdmin(d.logged_in);
+      setSessionEmail(d.email || "");
+      return d.logged_in;
+    } catch (e) { return false; }
+  }
+
+  async function doLogin(e) {
+    e.preventDefault();
+    setLoginErr("");
+    try {
+      await login(loginEmail, loginPassword);
+      setLoginOpen(false); setLoginPassword("");
+      await refreshSession();
+      loadResumeFile();
+    } catch (e) { setLoginErr(e.message); }
+  }
+
+  async function doLogout() {
+    try { await logout(); } catch (e) { /* ignore */ }
+    setAdmin(false); setSessionEmail(""); setResumeFile(null);
+  }
   const fileRef = useRef(null);
   const [text, setText] = useState("");
   const [locations, setLocations] = useState("");
@@ -44,6 +77,8 @@ export default function Dashboard() {
   const [analysing, setAnalysing] = useState(false);
   const [profile, setProfile] = useState(null);
   const [detected, setDetected] = useState(null);
+  const [resumeFile, setResumeFile] = useState(null);
+  const [replacingResume, setReplacingResume] = useState(false);
 
   const [sources, setSources] = useState(DEFAULT_ON);
   const [remoteOnly, setRemoteOnly] = useState(false);
@@ -61,6 +96,7 @@ export default function Dashboard() {
   const [q, setQ] = useState("");
   const [fsource, setFsource] = useState("");
   const [fmin, setFmin] = useState("");
+  const [fMinAts, setFMinAts] = useState("");
   const [fexpMin, setFexpMin] = useState("");
   const [fexpMax, setFexpMax] = useState("");
   const [fexpUnknown, setFexpUnknown] = useState(true);
@@ -79,9 +115,9 @@ export default function Dashboard() {
   const [dbok, setDbok] = useState("");
   const [applicantSummary, setApplicantSummary] = useState("loading…");
   const [pending, setPending] = useState(loadPending());
-
   useEffect(() => {
-    api("/api/meta").then(d => setMaxUploadMb(d.max_upload_mb)).catch(() => {});
+    api("/api/meta").then(d => { setMaxUploadMb(d.max_upload_mb); setMeta(d); }).catch(() => {});
+    refreshSession().then(loggedIn => { if (loggedIn) loadResumeFile(); });
     loadJobs(); loadStats(); loadFiles(); loadApplicantSummary(); pollStatus();
     const onFocus = () => setPending(loadPending());
     window.addEventListener("focus", onFocus);
@@ -93,13 +129,14 @@ export default function Dashboard() {
     const t = debounce(loadJobs, 300);
     t();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [q, fsource, fmin, fexpMin, fexpMax, fexpUnknown, fremote, fstatus, flimit, fsort]);
+  }, [q, fsource, fmin, fMinAts, fexpMin, fexpMax, fexpUnknown, fremote, fstatus, flimit, fsort]);
 
   async function loadJobs() {
     const p = new URLSearchParams({ limit: flimit, sort: fsort });
     if (q.trim()) p.set("q", q.trim());
     if (fsource) p.set("source", fsource);
     if (fmin) p.set("min_score", fmin);
+    if (fMinAts) p.set("min_ats_score", fMinAts);
     if (fexpMin !== "") p.set("exp_min", fexpMin);
     if (fexpMax !== "") p.set("exp_max", fexpMax);
     p.set("include_unknown_exp", fexpUnknown ? "1" : "0");
@@ -191,14 +228,35 @@ export default function Dashboard() {
       setFexpMin(det.exp_min != null ? det.exp_min : "");
       setFexpMax(det.exp_max != null ? det.exp_max : "");
       setDetected(d.profile);
+      if (f && admin) { await loadResumeFile(); setReplacingResume(false); }
     } catch (e) {
       setRerr(e.message); setRstatus("");
     } finally { setAnalysing(false); }
   }
 
+  async function loadResumeFile() {
+    try { setResumeFile(await api("/api/resume/file")); }
+    catch (e) { setResumeFile(null); }
+  }
+
+  async function downloadResumeFile(e) {
+    e.preventDefault();
+    try {
+      const d = await api("/api/resume/file");
+      window.open(d.url, "_blank", "noopener,noreferrer");
+    } catch (e) { setRerr(e.message); }
+  }
+
   function toggleSource(name, on) {
     setSources(prev => {
+      // Apify is mutually exclusive with everything else: turning it on
+      // clears every other source, and turning any other source on turns
+      // Apify off. Turning Apify off falls back to the normal defaults.
+      if (name === "apify") {
+        return on ? new Set(["apify"]) : new Set(DEFAULT_ON);
+      }
       const next = new Set(prev);
+      next.delete("apify");
       if (on) next.add(name); else next.delete(name);
       return next;
     });
@@ -302,26 +360,71 @@ export default function Dashboard() {
       <header>
         <h1>Job Scraper</h1>
         <span className="sub">LinkedIn + Greenhouse + Ashby + Lever + Workable + Workday, scored against your resume</span>
-        <a className="btnlink ghostlink" href="/profile" style={{ marginLeft: "auto" }}>Apply kit →</a>
+        <div className="row" style={{ marginLeft: "auto", alignItems: "center" }}>
+          {admin ? (
+            <>
+              <span className="muted" style={{ fontSize: 12.5 }}>{sessionEmail}</span>
+              <button className="ghost" onClick={doLogout}>Log out</button>
+            </>
+          ) : loginOpen ? (
+            <form className="row" onSubmit={doLogin} style={{ alignItems: "center" }}>
+              <input type="email" value={loginEmail} onChange={e => setLoginEmail(e.target.value)}
+                     placeholder="admin email" required style={{ width: 180 }} />
+              <input type="password" value={loginPassword} onChange={e => setLoginPassword(e.target.value)}
+                     placeholder="password" required style={{ width: 130 }} />
+              <button type="submit">Log in</button>
+              <button type="button" className="ghost" onClick={() => { setLoginOpen(false); setLoginErr(""); }}>Cancel</button>
+              {loginErr && <span className="err" style={{ margin: 0 }}>{loginErr}</span>}
+            </form>
+          ) : (
+            <button className="ghost" onClick={() => setLoginOpen(true)}>Admin login</button>
+          )}
+          <a className="btnlink ghostlink" href="/profile">Apply kit →</a>
+        </div>
       </header>
       <main>
         <div className="grid">
           <div className="col-left">
             <div className="card">
               <h2>Resume</h2>
-              <label>Upload (PDF / DOCX / TXT / MD)</label>
-              <input type="file" ref={fileRef} accept=".pdf,.docx,.txt,.md" />
-              <label>Or paste text</label>
-              <textarea value={text} onChange={e => setText(e.target.value)}
-                        placeholder="Paste your resume here if you'd rather not upload a file" />
-              <label>Target locations (optional)</label>
-              <input type="text" value={locations} onChange={e => setLocations(e.target.value)}
-                     placeholder="Bengaluru, India, Dublin, Remote" />
-              <div className="row" style={{ marginTop: 12 }}>
-                <button id="analyse" disabled={analysing} onClick={analyse}>Analyse resume</button>
-                <span className="muted">{rstatus}</span>
-              </div>
-              <div className="err">{rerr}</div>
+              {!admin ? (
+                <div className="hint">
+                  {resumeFile
+                    ? <>This account runs on one stored resume: <b>{resumeFile.filename}</b>.</>
+                    : "Log in as admin to upload and manage the resume."}
+                </div>
+              ) : resumeFile && !replacingResume ? (
+                // One static resume per user: once one is stored, the raw
+                // upload form gets out of the way — this is the "current
+                // resume", not scratch space to keep re-filling in.
+                <div>
+                  <div className="hint">
+                    Current resume: <a href="#" onClick={downloadResumeFile}>{resumeFile.filename}</a>{" "}
+                    <span className="muted">(uploaded {new Date(resumeFile.uploaded_at).toLocaleString()})</span>
+                  </div>
+                  <button className="ghost" style={{ marginTop: 10 }}
+                          onClick={() => setReplacingResume(true)}>Replace resume</button>
+                </div>
+              ) : (
+                <>
+                  <label>Upload (PDF / DOCX / TXT / MD)</label>
+                  <input type="file" ref={fileRef} accept=".pdf,.docx,.txt,.md" />
+                  <label>Or paste text</label>
+                  <textarea value={text} onChange={e => setText(e.target.value)}
+                            placeholder="Paste your resume here if you'd rather not upload a file" />
+                  <label>Target locations (optional)</label>
+                  <input type="text" value={locations} onChange={e => setLocations(e.target.value)}
+                         placeholder="Bengaluru, India, Dublin, Remote" />
+                  <div className="row" style={{ marginTop: 12 }}>
+                    <button id="analyse" disabled={analysing} onClick={analyse}>Analyse resume</button>
+                    <span className="muted">{rstatus}</span>
+                    {resumeFile && (
+                      <button className="ghost" onClick={() => setReplacingResume(false)}>Cancel</button>
+                    )}
+                  </div>
+                  <div className="err">{rerr}</div>
+                </>
+              )}
               {detected && (
                 <div id="detected">
                   <div className="hint" style={{ marginTop: 15 }}>
@@ -342,13 +445,22 @@ export default function Dashboard() {
 
             <div className="card">
               <h2>Sources &amp; filters</h2>
-              {SOURCE_OPTS.map(([id, name, label, note]) => (
-                <label className="chk" key={id}>
-                  <input type="checkbox" checked={sources.has(name)}
-                         onChange={e => toggleSource(name, e.target.checked)} /> {label}{" "}
-                  {note && <span className="muted">{note}</span>}
-                </label>
-              ))}
+              {SOURCE_OPTS.map(([id, name, label, note]) => {
+                const apifyOn = sources.has("apify");
+                const disabled = name === "apify" ? false : apifyOn;
+                return (
+                  <label className="chk" key={id} style={disabled ? { opacity: 0.45 } : undefined}>
+                    <input type="checkbox" checked={sources.has(name)} disabled={disabled}
+                           onChange={e => toggleSource(name, e.target.checked)} /> {label}{" "}
+                    {note && <span className="muted">{note}</span>}
+                  </label>
+                );
+              })}
+              {sources.has("apify") && !meta.apify_configured && (
+                <div className="hint" style={{ color: "var(--warn)" }}>
+                  APIFY_TOKEN isn't set on the server — this run (and its cron) will fail until it is.
+                </div>
+              )}
               <label className="chk" style={{ marginTop: 14 }}>
                 <input type="checkbox" checked={remoteOnly}
                        onChange={e => { setRemoteOnly(e.target.checked); setFremote(e.target.checked); }} />
@@ -419,11 +531,12 @@ export default function Dashboard() {
                 </div>
               )}
             </div>
+
           </div>
 
           <div className="col-right">
             <div className="card progress-card">
-              {isAdmin() ? (
+              {admin ? (
                 <details id="progress" open={progressOpen} onToggle={e => setProgressOpen(e.target.open)}>
                   <summary><h2 style={{ display: "inline", margin: 0 }}>Progress</h2>
                     <span className="muted">{runStatusText}</span></summary>
@@ -458,6 +571,8 @@ export default function Dashboard() {
                 </select>
                 <input type="number" value={fmin} onChange={e => setFmin(e.target.value)}
                        placeholder="min score" style={{ width: 98 }} />
+                <input type="number" value={fMinAts} onChange={e => setFMinAts(e.target.value)}
+                       placeholder="min ATS score" min="0" max="100" style={{ width: 110 }} />
               </div>
               <div className="row" style={{ marginTop: 8 }}>
                 <span className="muted" style={{ fontSize: 12 }}>Years of experience</span>
@@ -491,6 +606,8 @@ export default function Dashboard() {
                 </select>
                 <select value={fsort} onChange={e => setFsort(e.target.value)} style={{ width: "auto" }}>
                   <option value="score">sort: best match</option>
+                  <option value="ats">sort: ATS score (Claude)</option>
+                  <option value="recent">sort: recently added</option>
                   <option value="exp_asc">sort: experience, low first</option>
                   <option value="exp_desc">sort: experience, high first</option>
                 </select>
@@ -525,7 +642,12 @@ export default function Dashboard() {
                   <tbody>
                     {jobs.length ? jobs.map(j => (
                       <tr key={j.job_id} className={j.status ? "done" : ""}>
-                        <td className="c-score score">{(j.score ?? 0).toFixed(0)}</td>
+                        <td className="c-score score">
+                          {(j.score ?? 0).toFixed(0)}
+                          {j.ats_score != null && (
+                            <div className="rowsub" title={j.ats_reason || ""}>ATS {j.ats_score}</div>
+                          )}
+                        </td>
                         <td className="c-title">{j.title}
                           <div className="rowsub">{[j.company, j.location].filter(Boolean).join(" · ")}</div>
                           <div className="terms">{shortTerms(j.matched_terms)}</div>

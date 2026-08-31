@@ -21,6 +21,7 @@ Single-user local tool: one run at a time, state in memory.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import sqlite3
@@ -32,9 +33,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlparse
 
-from flask import Flask, jsonify, redirect, request, send_from_directory
+from flask import Flask, jsonify, redirect, request, send_from_directory, session
 from werkzeug.exceptions import HTTPException
 
+import app.apify_linkedin as apify_linkedin
+import app.ats_score as ats_score
 import app.resume as resume_mod
 import app.sources as sources
 from app.config import Config
@@ -68,6 +71,7 @@ BOARD_SOURCES = {
 }
 
 app = Flask(__name__)
+app.secret_key = Config.SECRET_KEY
 
 # Scanned / image-heavy resumes blow past a small cap easily, and the browser
 # reports an over-limit upload as an unparseable failure, so keep it generous.
@@ -138,6 +142,11 @@ def do_run(profile_raw: Dict[str, Any], opts: Dict[str, Any]) -> None:
     profile = SearchProfile.from_dict(profile_raw)
     target = int(opts.get("target") or 100)
     use = set(opts.get("sources") or ["linkedin", "greenhouse", "workday"])
+    if "apify" in use:
+        # Mutually exclusive with every other source — enforced here too,
+        # not just by the UI unchecking boxes, since a client can't be
+        # trusted to actually send what its checkboxes showed.
+        use = {"apify"}
     since_days = opts.get("since_days")
     remote_only = bool(opts.get("remote_only"))
     if remote_only:
@@ -182,6 +191,23 @@ def do_run(profile_raw: Dict[str, Any], opts: Dict[str, Any]) -> None:
             jobs.extend(found)
             note(name, found)
             log(f"{name.title()}: {len(found)} postings")
+
+        if "apify" in use:
+            log("Apify LinkedIn: searching (last 24 hours)…")
+            keywords = " ".join(profile.keywords[:8]) or " ".join(profile.scoring.must_have_terms[:8])
+            found = apify_linkedin.fetch_linkedin_jobs(
+                token=Config.APIFY_TOKEN,
+                keywords=keywords,
+                locations=profile.locations,
+                profile_name=profile.name,
+                limit_per_search=Config.APIFY_LIMIT_PER_SEARCH,
+                progress=log,
+            )
+            for job in found:
+                job.profile = profile.name
+            jobs.extend(found)
+            note("apify", found)
+            log(f"Apify LinkedIn: {len(found)} postings")
 
         if "workday" in use:
             log("Workday: searching tenants…")
@@ -277,6 +303,25 @@ def do_run(profile_raw: Dict[str, Any], opts: Dict[str, Any]) -> None:
             log(f"NOTE: {len(kept)} matches < target {target}. Widen locations, "
                 f"the year range, or the time window, or lower min_score.")
 
+        if Config.ANTHROPIC_API_KEY and kept:
+            # kept is already sorted by keyword score; the top slice is
+            # what's worth paying Claude to look at more closely. Jobs
+            # mutate in place, so this also updates their entry in `jobs`
+            # below without needing to be threaded through separately.
+            resume_meta = store.get_resume_file()
+            resume_text = None
+            if resume_meta:
+                resume_bytes = s3_service.download_bytes(resume_meta["s3_key"])
+                if resume_bytes:
+                    try:
+                        resume_text = resume_mod.extract_text(resume_bytes, resume_meta["filename"])
+                    except resume_mod.ResumeError as exc:
+                        log(f"ATS (Claude): couldn't read stored resume ({exc}), skipping")
+            if resume_text:
+                ats_score.score_jobs(kept[:Config.ATS_TOP_N], resume_text, progress=log)
+            else:
+                log("ATS (Claude): no resume file stored in S3 yet, skipping")
+
         inserted, updated = store.upsert_many(jobs)
         with RUN_LOCK:
             RUN["inserted"], RUN["updated"] = inserted, updated
@@ -304,8 +349,25 @@ def do_run(profile_raw: Dict[str, Any], opts: Dict[str, Any]) -> None:
         log("Run finished.")
 
 
+def _is_apify_only(options: Dict[str, Any]) -> bool:
+    return set(options.get("sources") or []) == {"apify"}
+
+
+def _start_cron_run(saved: Dict[str, Any], label: str) -> None:
+    with RUN_LOCK:
+        if RUN["running"]:
+            return
+        RUN.update(running=True, log=[], started=time.time(), finished=None,
+                   found=0, kept=0, inserted=0, updated=0, error=None, per_source={})
+    log(f"{label}: starting scheduled run")
+    do_run(saved["profile"], saved["options"])
+
+
 def _auto_run_loop() -> None:
-    """The cron: replays the last manually-run search on a fixed interval.
+    """The board-scrape cron: replays the one saved resume's last manual run
+    on a fixed interval — but only when that run wasn't an Apify-only run,
+    since those are billed per result and get their own slower cadence
+    below.
 
     ponytail: one in-process thread with a plain sleep loop, matching the
     "single run, in memory" model the rest of this file already uses — swap
@@ -323,15 +385,9 @@ def _auto_run_loop() -> None:
                 saved = store.get_search_profile()
             finally:
                 store.close()
-            if not saved:
-                continue  # nothing analysed yet — nothing to replay
-            with RUN_LOCK:
-                if RUN["running"]:
-                    continue
-                RUN.update(running=True, log=[], started=time.time(), finished=None,
-                           found=0, kept=0, inserted=0, updated=0, error=None, per_source={})
-            log("Cron: starting scheduled run")
-            do_run(saved["profile"], saved["options"])
+            if not saved or _is_apify_only(saved["options"]):
+                continue  # nothing to replay, or it's the Apify cron's turn instead
+            _start_cron_run(saved, "Cron")
         except Exception:  # noqa: BLE001 - one bad tick must not kill the loop
             app.logger.exception("Auto-run tick failed")
 
@@ -342,8 +398,66 @@ def _auto_run_loop() -> None:
 threading.Thread(target=_auto_run_loop, daemon=True).start()
 
 
+def _apify_auto_run_loop() -> None:
+    """The Apify LinkedIn cron: same saved resume as _auto_run_loop above,
+    but only replayed when its sources were Apify-only, and on a slower,
+    separate interval (3x/day at the default 8h) since Apify bills per
+    result.
+    """
+    while True:
+        time.sleep(Config.APIFY_CRON_INTERVAL_SECONDS)
+        if not Config.APIFY_TOKEN:
+            continue  # not configured — nothing to do this tick
+        try:
+            with RUN_LOCK:
+                if RUN["running"]:
+                    continue
+            store = MongoJobStore()
+            try:
+                saved = store.get_search_profile()
+            finally:
+                store.close()
+            if not saved or not _is_apify_only(saved["options"]):
+                continue  # last run wasn't an Apify run — nothing to replay here
+            _start_cron_run(saved, "Apify cron")
+        except Exception:  # noqa: BLE001 - one bad tick must not kill the loop
+            app.logger.exception("Apify auto-run tick failed")
+
+
+threading.Thread(target=_apify_auto_run_loop, daemon=True).start()
+
+
 def _is_admin(req) -> bool:
-    return bool(Config.ADMIN_TOKEN) and req.headers.get("X-Admin-Token") == Config.ADMIN_TOKEN
+    return bool(session.get("is_admin"))
+
+
+@app.post("/api/login")
+def api_login():
+    if not Config.ADMIN_PASSWORD:
+        return jsonify(error="Login isn't configured on the server yet."), 503
+    body = request.get_json(silent=True) or {}
+    email = (body.get("email") or "").strip().lower()
+    password = body.get("password") or ""
+    # Constant-time comparisons — a plain == leaks how many leading
+    # characters matched via response timing, cheap to avoid.
+    email_ok = hmac.compare_digest(email, Config.ADMIN_EMAIL.strip().lower())
+    password_ok = hmac.compare_digest(password, Config.ADMIN_PASSWORD)
+    if not (email_ok and password_ok):
+        return jsonify(error="Invalid email or password."), 401
+    session["is_admin"] = True
+    session["email"] = Config.ADMIN_EMAIL
+    return jsonify(ok=True, email=Config.ADMIN_EMAIL)
+
+
+@app.post("/api/logout")
+def api_logout():
+    session.clear()
+    return jsonify(ok=True)
+
+
+@app.get("/api/session")
+def api_session():
+    return jsonify(logged_in=bool(session.get("is_admin")), email=session.get("email"))
 
 
 # --------------------------------------------------------------------------
@@ -352,6 +466,8 @@ def _is_admin(req) -> bool:
 
 @app.post("/api/resume")
 def api_resume():
+    if not _is_admin(request):
+        return jsonify(error="Log in to upload or replace the resume."), 403
     upload = request.files.get("file")
     pasted = (request.form.get("text") or "").strip()
 
@@ -360,11 +476,21 @@ def api_resume():
             file_bytes = upload.read()
             text = resume_mod.extract_text(file_bytes, upload.filename)
             origin = upload.filename
-            
-            # Save uploaded resume to S3
+
+            # One static resume per deployment: always the same S3 key, so
+            # a new upload replaces the old one instead of piling up under
+            # per-filename keys. Extension kept so it still opens correctly.
             import io
+            ext = os.path.splitext(upload.filename)[1] or ""
+            s3_key = f"resumes/static_resume{ext}"
             file_obj = io.BytesIO(file_bytes)
-            s3_service.upload_fileobj(file_obj, f"resumes/{upload.filename}")
+            if s3_service.upload_fileobj(file_obj, s3_key):
+                store = MongoJobStore()
+                try:
+                    store.save_resume_file(s3_key, upload.filename,
+                                          upload.content_type or "application/octet-stream")
+                finally:
+                    store.close()
         elif pasted:
             text, origin = pasted, "pasted text"
         else:
@@ -383,8 +509,28 @@ def api_resume():
     return jsonify(profile=profile, source=origin)
 
 
+@app.get("/api/resume/file")
+def api_resume_file():
+    """A short-lived download link for the one static resume on file."""
+    if not _is_admin(request):
+        return jsonify(error="Admin access required."), 403
+    store = MongoJobStore()
+    try:
+        meta = store.get_resume_file()
+    finally:
+        store.close()
+    if not meta:
+        return jsonify(error="No resume file stored yet — upload one first."), 404
+    url = s3_service.presigned_url(meta["s3_key"])
+    if not url:
+        return jsonify(error="S3 isn't configured, or the file couldn't be reached."), 400
+    return jsonify(url=url, **meta)
+
+
 @app.post("/api/run")
 def api_run():
+    if not _is_admin(request):
+        return jsonify(error="Log in to run a search."), 403
     with RUN_LOCK:
         if RUN["running"]:
             return jsonify(error="A run is already in progress."), 409
@@ -431,6 +577,7 @@ def api_jobs():
         # than whatever survived the page limit.
         filters = dict(
             min_score=float(request.args.get("min_score") or 0),
+            min_ats_score=as_int("min_ats_score"),
             profile=request.args.get("profile") or None,
             since_days=as_int("since_days"),
             include_rejected=request.args.get("include_rejected") == "1",
@@ -498,7 +645,7 @@ def api_export():
         uploaded = []
         for file in new:
             file_path = os.path.join(cfg.output_dir, file)
-            if s3_service.upload_file(file_path):
+            if s3_service.upload_file(file_path, f"exports/{file}"):
                 uploaded.append(file)
         return jsonify(ok=True, rows=len(rows), files=new, uploaded_to_s3=uploaded)
     finally:
@@ -953,6 +1100,8 @@ def api_meta():
     """Everything the React app would otherwise hardcode twice."""
     return jsonify(max_upload_mb=MAX_UPLOAD_MB,
                    screening=SCREENING_QUESTIONS,
+                   apify_configured=bool(Config.APIFY_TOKEN),
+                   apify_interval_hours=Config.APIFY_CRON_INTERVAL_SECONDS / 3600,
                    applicant_fields=APPLICANT_FIELDS,
                    lists=PROFILE_LISTS,
                    max_entries=MAX_ENTRIES)
